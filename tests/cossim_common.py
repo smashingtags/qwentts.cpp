@@ -43,13 +43,16 @@ sys.modules["qwen_tts"] = _qwen_pkg
 
 _core_pkg          = types.ModuleType("qwen_tts.core")
 _core_pkg.__path__ = [os.path.join(UPSTREAM_ROOT, "qwen_tts", "core")]
+# Inject the stubbed core module before any submodule import so the real
+# qwen_tts/core/__init__.py never runs : it pulls the V1 25Hz tokenizer that
+# imports whisper_encoder, which prints a flash-attn warning at module load.
+sys.modules["qwen_tts.core"] = _core_pkg
 from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2    import Qwen3TTSTokenizerV2Model
 _core_pkg.Qwen3TTSTokenizerV1Config = _StubV1Config
 _core_pkg.Qwen3TTSTokenizerV1Model  = _StubV1Model
 _core_pkg.Qwen3TTSTokenizerV2Config = Qwen3TTSTokenizerV2Config
 _core_pkg.Qwen3TTSTokenizerV2Model  = Qwen3TTSTokenizerV2Model
-sys.modules["qwen_tts.core"] = _core_pkg
 
 from qwen_tts.core.models.modeling_qwen3_tts      import Qwen3TTSForConditionalGeneration
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig

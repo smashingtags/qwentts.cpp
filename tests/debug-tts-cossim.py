@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Cossim debug : C++ qwen-tts vs Python Qwen3-TTS on the Base 1.7B path.
+"""Cossim debug : C++ qwen-tts vs Python Qwen3-TTS on the VoiceDesign 1.7B path.
 
 Inputs (relative to CWD = tests/) :
     ../examples/prompt.txt       target text fed to both pipelines
+    --instruct flag              style instruction, default mirrors tts.sh
 
-Default mode is greedy (do_sample=False on both sides). The forward
-chain is dumped layer by layer and compared paired with the Python
-upstream hooks installed by cossim_common.install_hooks. Both pipelines
-run on CUDA by default, the wrapper shell sweeps backends and quants.
+Default mode is greedy (do_sample=False on both sides). Cote Python the
+utterance and the instruction are tokenized separately and passed to
+model.generate as input_ids and instruct_ids, mirroring exactly what
+qwen_tts.inference.qwen3_tts_model.generate_voice_design does. Cote C++
+both strings are passed through --text and --instruct, the prompt builder
+wraps and tokenizes them in the same order.
 
-Dumps land in cpp/base/ (C++) and python/base/ (Python). The script
-compares each matching .bin pair via cosine similarity over the f32
-payload, plus exact match rate for tensors that originated as int
-(codec codes, prompt ids).
+Dumps land in cpp/tts/ (C++) and python/tts/ (Python).
 """
 
 import argparse
@@ -26,21 +26,25 @@ import torch
 
 import cossim_common as cc
 
-MODEL_T     = "../models/qwen-talker-1.7b-base-{q}.gguf"
+MODEL_T     = "../models/qwen-talker-1.7b-voicedesign-{q}.gguf"
 MODEL_CDC_T = "../models/qwen-tokenizer-12hz-{q}.gguf"
-CKPT        = "../checkpoints/Qwen3-TTS-12Hz-1.7B-Base"
-DUMP_CPP    = "cpp/base"
-DUMP_PT     = "python/base"
+CKPT        = "../checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+DUMP_CPP    = "cpp/tts"
+DUMP_PT     = "python/tts"
+
+DEFAULT_INSTRUCT = "male, young adult, moderate pitch"
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt",         default="../examples/prompt.txt")
+    ap.add_argument("--instruct",       default=DEFAULT_INSTRUCT,
+                    help="natural language style instruction")
     ap.add_argument("--seed",           type=int, default=42)
     ap.add_argument("--lang",           default="english")
     ap.add_argument("--quant",          default="F32",
                     help="GGUF quantization suffix (F32, BF16, Q8_0, Q4_K_M)")
-    ap.add_argument("--out-pt",         default=os.path.join(DUMP_PT,  "base-python.wav"))
-    ap.add_argument("--out-cpp",        default=os.path.join(DUMP_CPP, "base-cpp.wav"))
+    ap.add_argument("--out-pt",         default=os.path.join(DUMP_PT,  "tts-python.wav"))
+    ap.add_argument("--out-cpp",        default=os.path.join(DUMP_CPP, "tts-cpp.wav"))
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--trace",          action="store_true",
                     help="print per sample u and idx for the first 32 samples")
@@ -53,6 +57,7 @@ def main():
     with open(args.prompt, "r", encoding="utf-8") as f:
         text = f.read().strip()
     print(f"[Input] Prompt: {len(text)} chars: {text[:60]}{'...' if len(text) > 60 else ''}")
+    print(f"[Input] Instruct: {args.instruct}")
     print(f"[Input] Lang: {args.lang} Seed: {args.seed} MaxNewTokens: {args.max_new_tokens}")
     print(f"[Input] Mode: greedy")
 
@@ -72,13 +77,24 @@ def main():
     ).eval()
     processor = cc.AutoProcessor.from_pretrained(CKPT, fix_mistral_regex=True)
 
+    # Utterance text wrapped as assistant role, mirrors _build_assistant_text
+    # in qwen_tts.inference.qwen3_tts_model.
     assistant_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-    inp = processor(text=assistant_text, return_tensors="pt", padding=True)
-    input_ids = inp["input_ids"].to(device)
+    inp_utt   = processor(text=assistant_text, return_tensors="pt", padding=True)
+    input_ids = inp_utt["input_ids"].to(device)
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
     print(f"[Python] InputIds shape: {tuple(input_ids.shape)}")
     cc.save_dump_i32(os.path.join(DUMP_PT, "prompt-ids.bin"), input_ids[0])
+
+    # Instruct text wrapped as user role, mirrors _build_instruct_text.
+    instruct_text = f"<|im_start|>user\n{args.instruct}<|im_end|>\n"
+    inp_ins      = processor(text=instruct_text, return_tensors="pt", padding=True)
+    instruct_ids = inp_ins["input_ids"].to(device)
+    if instruct_ids.dim() == 1:
+        instruct_ids = instruct_ids.unsqueeze(0)
+    print(f"[Python] InstructIds shape: {tuple(instruct_ids.shape)}")
+    cc.save_dump_i32(os.path.join(DUMP_PT, "instruct-ids.bin"), instruct_ids[0])
 
     cc.install_hooks(model, DUMP_PT)
 
@@ -87,13 +103,6 @@ def main():
     # the strict validator. Disable it on the talker only.
     model.talker._validate_model_kwargs = lambda *a, **k: None
 
-    # Greedy hardcoded : argmax on both talker c0 and code predictor sub
-    # codes. Stochastic mode is not exercised here because the F32 drift
-    # between torch CUDA cuBLAS and ggml CUDA matmul on Qwen3 norm_w
-    # inflated activations propagates through the FFN and flips multinomial
-    # picks in flat distributions, breaking bit exactness. Argmax is robust
-    # to that drift, so greedy gives 100 percent CodesFull match and
-    # validates the full forward + sampling chain.
     gen_kwargs = dict(
         do_sample             = False,
         top_k                 = 1,
@@ -108,6 +117,7 @@ def main():
 
     talker_codes_list, _ = model.generate(
         input_ids=[input_ids],
+        instruct_ids=[instruct_ids],
         languages=[args.lang],
         non_streaming_mode=True,
         max_new_tokens=args.max_new_tokens,
@@ -141,14 +151,15 @@ def main():
 
     cmd = [
         cc.BIN,
-        "--model",   model_lm,
-        "--codec",   model_cdc,
-        "--seed",    str(args.seed),
-        "--text",    text,
-        "--lang",    args.lang,
-        "--max-new", str(args.max_new_tokens),
-        "--dump",    DUMP_CPP,
-        "-o",        args.out_cpp,
+        "--model",    model_lm,
+        "--codec",    model_cdc,
+        "--seed",     str(args.seed),
+        "--text",     text,
+        "--instruct", args.instruct,
+        "--lang",     args.lang,
+        "--max-new",  str(args.max_new_tokens),
+        "--dump",     DUMP_CPP,
+        "-o",         args.out_cpp,
         "--greedy",
     ]
     print(f"[GGML] Cmd: {' '.join(cmd)}")
@@ -169,9 +180,6 @@ def main():
     aa, ab = cc.pair("output-audio.bin", DUMP_CPP, DUMP_PT)
     print(f"[Cossim] Audio cos: {cc.cos(aa, ab):.6f}")
 
-    # STFT runs on the f32 bin dumps, not the WAV files : the C++ side writes
-    # PCM_16 which quantizes the very low amplitudes of greedy short outputs
-    # to zero, while the bin dumps preserve the raw float buffer.
     n = min(aa.size, ab.size)
     print(f"[Cossim] WAV stft_cos: {cc.stft_cos(aa.ravel()[:n], ab.ravel()[:n]):.6f} samples: {n}")
 

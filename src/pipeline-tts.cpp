@@ -316,6 +316,18 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         debug_dump_2d(&d, "talker-input-embed", prompt.input_embed.data(), prompt.T_ctx, prompt.hidden);
         debug_dump_2d(&d, "trailing-text-hidden", prompt.trailing_text_hidden.data(), prompt.T_trailing, prompt.hidden);
         debug_dump_1d(&d, "tts-pad-embed", prompt.tts_pad_embed.data(), prompt.hidden);
+
+        // Voice clone dumps : speaker-emb fires when ref_audio is set
+        // (modes A and B), ref-codes fires only when ref_text is also set
+        // (mode B ICL). Both are no-ops in base / tts / customvoice modes,
+        // the dump files simply do not appear in those runs.
+        if (ref_spk_emb_ptr != NULL) {
+            debug_dump_1d(&d, "speaker-emb", ref_spk_emb_ptr, pt->talker.hidden_size);
+        }
+        if (ref_codes_T > 0) {
+            const int shape[2] = { pt->num_code_groups, ref_codes_T };
+            debug_dump_i32_as_f32(&d, "ref-codes", ref_codes.data(), shape, 2);
+        }
     }
 
     // Generation loop : at each step we recompute the full Talker prefix
