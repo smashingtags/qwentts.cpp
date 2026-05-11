@@ -43,9 +43,10 @@ static void print_usage(const char * prog) {
             "  --ref-audio <wav>       Reference WAV path for voice clone (Base only). Mutually\n"
             "                          exclusive with --speaker. Mode A (x_vector_only) extracts\n"
             "                          a speaker embedding via the ECAPA-TDNN encoder.\n"
-            "  --ref-text <s>          Reference transcript for voice clone ICL mode (Base only,\n"
-            "                          requires --ref-audio). Switches the prompt to ICL mode B\n"
-            "                          where the talker conditions on the reference codec codes.\n"
+            "  --ref-text <path>       Path to a UTF-8 text file containing the reference\n"
+            "                          transcript for voice clone ICL mode (Base only, requires\n"
+            "                          --ref-audio). Switches the prompt to ICL mode B where the\n"
+            "                          talker conditions on the reference codec codes.\n"
             "  --max-new <n>           Max new audio frames (default: 2048)\n"
             "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n\n"
             "Sampling options:\n"
@@ -71,7 +72,7 @@ struct Args {
     const char * instruct;
     const char * speaker;
     const char * ref_audio;
-    const char * ref_text;
+    const char * ref_text_path;
     const char * dump_dir;
     const char * out_wav;
     const char * format;
@@ -98,6 +99,34 @@ static std::string read_stdin_text() {
         s.pop_back();
     }
     return s;
+}
+
+// Read a small text file into a string. Trims trailing newlines.
+static bool read_text_file(const char * path, std::string & out) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[CLI] FATAL: cannot open '%s'\n", path);
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        fclose(f);
+        fprintf(stderr, "[CLI] FATAL: ftell failed on '%s'\n", path);
+        return false;
+    }
+    out.resize((size_t) sz);
+    if (sz > 0 && fread(&out[0], 1, (size_t) sz, f) != (size_t) sz) {
+        fclose(f);
+        fprintf(stderr, "[CLI] FATAL: fread failed on '%s'\n", path);
+        return false;
+    }
+    fclose(f);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
+        out.pop_back();
+    }
+    return true;
 }
 
 static bool parse_args(int argc, char ** argv, Args & a) {
@@ -135,7 +164,7 @@ static bool parse_args(int argc, char ** argv, Args & a) {
         } else if (std::strcmp(arg, "--ref-audio") == 0 && i + 1 < argc) {
             a.ref_audio = argv[++i];
         } else if (std::strcmp(arg, "--ref-text") == 0 && i + 1 < argc) {
-            a.ref_text = argv[++i];
+            a.ref_text_path = argv[++i];
         } else if (std::strcmp(arg, "--format") == 0 && i + 1 < argc) {
             a.format = argv[++i];
         } else if (std::strcmp(arg, "--dump") == 0 && i + 1 < argc) {
@@ -227,11 +256,30 @@ static int run(const Args & a) {
         backend_release(bp.backend, bp.cpu_backend);
         return 1;
     }
-    if (a.ref_text && !a.ref_audio) {
+    if (a.ref_text_path && !a.ref_audio) {
         fprintf(stderr, "[CLI] ERROR: --ref-text requires --ref-audio\n");
         pipeline_tts_free(&pt);
         backend_release(bp.backend, bp.cpu_backend);
         return 1;
+    }
+
+    // Load the reference transcript from the file passed via --ref-text.
+    // Empty content is rejected since the ICL prompt needs it non empty.
+    std::string  ref_text_buf;
+    const char * ref_text = NULL;
+    if (a.ref_text_path) {
+        if (!read_text_file(a.ref_text_path, ref_text_buf)) {
+            pipeline_tts_free(&pt);
+            backend_release(bp.backend, bp.cpu_backend);
+            return 1;
+        }
+        if (ref_text_buf.empty()) {
+            fprintf(stderr, "[CLI] ERROR: --ref-text file '%s' is empty\n", a.ref_text_path);
+            pipeline_tts_free(&pt);
+            backend_release(bp.backend, bp.cpu_backend);
+            return 1;
+        }
+        ref_text = ref_text_buf.c_str();
     }
 
     // Resolve output WAV format string : wav16 / wav24 / wav32. Default
@@ -286,7 +334,7 @@ static int run(const Args & a) {
     p.instruct                    = a.instruct;
     p.speaker                     = a.speaker;
     p.ref_audio                   = a.ref_audio;
-    p.ref_text                    = a.ref_text;
+    p.ref_text                    = ref_text;
     p.seed                        = seed;
     p.max_new_tokens              = a.max_new_tokens;
     p.do_sample                   = a.do_sample;
