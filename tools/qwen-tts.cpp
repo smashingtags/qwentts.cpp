@@ -13,7 +13,6 @@
 // --text or stdin if --text is absent.
 
 #include "audio-io.h"
-#include "pipeline-codec.h"
 #include "qwen.h"
 
 #include <cstdio>
@@ -58,6 +57,9 @@ static void print_usage(const char * prog) {
             "  --sub-temp <f>          Sub-talker temperature (default: 0.9)\n"
             "  --sub-top-k <n>         Sub-talker top-k (default: 50)\n"
             "  --sub-top-p <f>         Sub-talker top-p (default: 1.0)\n\n"
+            "Backend options:\n"
+            "  --no-fa                 Disable flash attention (manual F32 attention chain)\n"
+            "  --clamp-fp16            Clamp hidden states + V to FP16 range (sub Ampere CUDA)\n\n"
             "Debug:\n"
             "  --dump <dir>            Dump intermediate tensors for cossim debug\n",
             prog);
@@ -86,6 +88,8 @@ struct Args {
     float        subtalker_top_p;
     float        subtalker_temperature;
     bool         subtalker_do_sample;
+    bool         use_fa;
+    bool         clamp_fp16;
 };
 
 // Read all of stdin into a string. Trims trailing newlines so a piped
@@ -143,6 +147,8 @@ static bool parse_args(int argc, char ** argv, Args & a) {
     a.subtalker_top_k       = 50;
     a.subtalker_top_p       = 1.0f;
     a.subtalker_temperature = 0.9f;
+    a.use_fa                = true;
+    a.clamp_fp16            = false;
     for (int i = 1; i < argc; i++) {
         const char * arg = argv[i];
         if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
@@ -194,6 +200,10 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             a.subtalker_top_k = std::atoi(argv[++i]);
         } else if (std::strcmp(arg, "--sub-top-p") == 0 && i + 1 < argc) {
             a.subtalker_top_p = (float) std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--no-fa") == 0) {
+            a.use_fa = false;
+        } else if (std::strcmp(arg, "--clamp-fp16") == 0) {
+            a.clamp_fp16 = true;
         } else if (std::strcmp(arg, "-o") == 0 && i + 1 < argc) {
             a.out_wav = argv[++i];
         } else {
@@ -213,6 +223,8 @@ static int run(const Args & a) {
     qt_init_default_params(&iparams);
     iparams.talker_path = a.model;
     iparams.codec_path  = a.codec;
+    iparams.use_fa      = a.use_fa;
+    iparams.clamp_fp16  = a.clamp_fp16;
 
     qt_context * q = qt_init(&iparams);
     if (!q) {
@@ -246,7 +258,7 @@ static int run(const Args & a) {
     int                                      ref_n_samples = 0;
     if (a.ref_wav) {
         int     T_in = 0;
-        float * raw  = audio_read_mono(a.ref_wav, TOKENIZER_SAMPLE_RATE, &T_in);
+        float * raw  = audio_read_mono(a.ref_wav, QT_CODEC_SAMPLE_RATE, &T_in);
         if (!raw || T_in <= 0) {
             fprintf(stderr, "[CLI] ERROR: cannot read --ref-wav '%s'\n", a.ref_wav);
             if (raw) {

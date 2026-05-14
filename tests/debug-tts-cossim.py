@@ -32,12 +32,10 @@ CKPT        = "../checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 DUMP_CPP    = "cpp/tts"
 DUMP_PT     = "python/tts"
 
-DEFAULT_INSTRUCT = "male, young adult, moderate pitch"
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt",         default="../examples/prompt.txt")
-    ap.add_argument("--instruct",       default=DEFAULT_INSTRUCT,
+    ap.add_argument("--instruct",       default="male, young adult, moderate pitch",
                     help="natural language style instruction")
     ap.add_argument("--seed",           type=int, default=42)
     ap.add_argument("--lang",           default="english")

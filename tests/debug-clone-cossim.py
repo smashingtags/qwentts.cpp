@@ -13,7 +13,7 @@ length, the shorter one padded with tts_pad / truncated as needed.
 
 Cote Python the speaker embedding is captured directly via
 model.extract_speaker_embedding, and the reference codec frames via
-model.speech_tokenizer.encode. Both intermediates land as speaker-emb.bin
+model.speech_tokenizer.encode. Both intermediates land as spk-emb.bin
 and ref-codes.bin and are compared against the C++ side dumps emitted
 by pipeline-tts.cpp when --ref-wav and --ref-text are set.
 
@@ -37,9 +37,6 @@ MODEL_CDC_T = "../models/qwen-tokenizer-12hz-{q}.gguf"
 CKPT        = "../checkpoints/Qwen3-TTS-12Hz-1.7B-Base"
 DUMP_CPP    = "cpp/clone"
 DUMP_PT     = "python/clone"
-
-DEFAULT_REF_AUDIO = "../examples/freeman.wav"
-DEFAULT_REF_TEXT  = "../examples/freeman.txt"
 
 # Mode B adds two pre-talker stages to the standard list : the speaker
 # embedding extracted from the reference audio (ECAPA forward, projected to
@@ -65,7 +62,7 @@ STAGES_CLONE = cc.STAGES_STANDARD + [
     ("SpkBlock3",       "spk-block3.bin"),
     ("SpkMFA",          "spk-mfa.bin"),
     ("SpkASP",          "spk-asp.bin"),
-    ("SpeakerEmb",      "speaker-emb.bin"),
+    ("SpeakerEmb",      "spk-emb.bin"),
 ]
 
 def install_clone_hooks(model, dump_dir):
@@ -271,9 +268,9 @@ def dump_mel_mag_python(ref_wav, dump_dir):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt",         default="../examples/prompt.txt")
-    ap.add_argument("--ref-wav",      default=DEFAULT_REF_AUDIO,
+    ap.add_argument("--ref-wav",        default="../examples/freeman.wav",
                     help="reference WAV path for voice cloning")
-    ap.add_argument("--ref-text-file",  default=DEFAULT_REF_TEXT,
+    ap.add_argument("--ref-text",       default="../examples/freeman.txt",
                     help="path to a UTF-8 file with the transcript of ref-wav")
     ap.add_argument("--seed",           type=int, default=42)
     ap.add_argument("--lang",           default="english")
@@ -297,7 +294,7 @@ def main():
 
     with open(args.prompt, "r", encoding="utf-8") as f:
         text = f.read().strip()
-    with open(args.ref_text_file, "r", encoding="utf-8") as f:
+    with open(args.ref_text, "r", encoding="utf-8") as f:
         ref_text = f.read().strip()
     print(f"[Input] Prompt: {len(text)} chars: {text[:60]}{'...' if len(text) > 60 else ''}")
     print(f"[Input] RefAudio: {args.ref_wav}")
@@ -356,7 +353,7 @@ def main():
     # Extract speaker embedding via ECAPA forward, projected to talker hidden.
     spk_emb = model.extract_speaker_embedding(audio=ref_wav, sr=ref_sr)
     print(f"[Python] SpeakerEmb shape: {tuple(spk_emb.shape)} dtype: {spk_emb.dtype}")
-    cc.save_dump(os.path.join(DUMP_PT, "speaker-emb.bin"), spk_emb)
+    cc.save_dump(os.path.join(DUMP_PT, "spk-emb.bin"), spk_emb)
 
     # Encode the reference audio to 16 codebook codes at 12.5 Hz. The encode
     # call returns shape [T_codec, K=16] after the internal transpose, while
@@ -460,7 +457,7 @@ def main():
         "--seed",      str(args.seed),
         "--text",      text,
         "--ref-wav", args.ref_wav,
-        "--ref-text",  ref_text,
+        "--ref-text",  args.ref_text,
         "--lang",      args.lang,
         "--max-new",   str(args.max_new_tokens),
         "--dump",      DUMP_CPP,

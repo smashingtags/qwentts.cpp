@@ -103,11 +103,23 @@ static void parse_generation_defaults(const GGUFModel & gf, GenerationDefaults &
     g.max_new_tokens        = (int) gf_get_u32(gf, "generation.max_new_tokens");
 }
 
-bool pipeline_tts_load(PipelineTTS * pt, const char * talker_gguf_path, const char * codec_gguf_path, BackendPair bp) {
+bool pipeline_tts_load(PipelineTTS * pt,
+                       const char *  talker_gguf_path,
+                       const char *  codec_gguf_path,
+                       BackendPair   bp,
+                       bool          use_fa,
+                       bool          clamp_fp16) {
     pt->bp                  = bp;
     pt->backend             = bp.backend;
     pt->sched               = NULL;
     pt->has_speaker_encoder = false;
+
+    // Fused flash attention needs a GPU kernel; CPU only backends fall
+    // back to the F32 manual chain automatically. clamp_fp16 is forwarded
+    // verbatim: a no op on backends that already accumulate in F32, an
+    // FP16 overflow guard on sub Ampere CUDA tensor cores.
+    pt->use_flash_attn = use_fa && bp.has_gpu;
+    pt->clamp_fp16     = clamp_fp16;
 
     if (!gf_load(&pt->gguf_talker, talker_gguf_path)) {
         qt_log(QT_LOG_ERROR, "[Pipeline] failed to load talker GGUF: %s", talker_gguf_path);
@@ -217,9 +229,11 @@ bool pipeline_tts_load(PipelineTTS * pt, const char * talker_gguf_path, const ch
     }
 
     qt_log(QT_LOG_INFO,
-           "[Pipeline] Loaded: arch=%s variant=%s tokenizer=%s codebooks=%d speaker_encoder=%s speakers=%zu",
+           "[Pipeline] Loaded: arch=%s variant=%s tokenizer=%s codebooks=%d speaker_encoder=%s speakers=%zu fa=%s "
+           "clamp_fp16=%s",
            pt->model_size.c_str(), pt->model_type.c_str(), pt->tokenizer_type.c_str(), pt->num_code_groups,
-           pt->has_speaker_encoder ? "loaded" : "absent", pt->speakers.size());
+           pt->has_speaker_encoder ? "loaded" : "absent", pt->speakers.size(), pt->use_flash_attn ? "on" : "off",
+           pt->clamp_fp16 ? "on" : "off");
     return true;
 }
 
@@ -267,23 +281,56 @@ static void embed_row_from_gguf(const GGUFModel & gf, const char * tensor_name, 
     tt->to_float(row, dst, hidden);
 }
 
-bool pipeline_tts_synthesize(PipelineTTS *                       pt,
-                             BPETokenizer *                      tok,
-                             const PipelineTTSSynthesizeParams & params,
-                             PipelineTTSSynthesizeOutput *       out) {
-    out->audio.clear();
+// Helper: malloc a heap copy of a float vector and hand it off into the
+// public qt_audio struct. Returns true on success; on OOM sets the
+// error string and leaves out untouched. Empty vectors land as an
+// allocation of size 0 with a stub malloc to keep the free path simple.
+static bool fill_qt_audio(const std::vector<float> & audio, qt_audio * out) {
+    const size_t n     = audio.size();
+    const size_t bytes = n * sizeof(float);
+    float *      buf   = (float *) std::malloc(bytes > 0 ? bytes : 1);
+    if (!buf) {
+        qt_set_error("pipeline_tts_synthesize: malloc failed for %zu samples", n);
+        return false;
+    }
+    if (n > 0) {
+        std::memcpy(buf, audio.data(), bytes);
+    }
+    out->samples     = buf;
+    out->n_samples   = (int) n;
     out->sample_rate = TOKENIZER_SAMPLE_RATE;
+    out->channels    = 1;
+    return true;
+}
 
+int pipeline_tts_duration_sec_to_tokens(const PipelineTTS * /*pt*/, float duration_sec) {
+    // The 12 Hz Qwen3-TTS tokenizer has a fixed hop of 1920 samples at
+    // 24 kHz, so the frame rate is 24000 / 1920 = 12.5 Hz regardless of
+    // the variant loaded. Clamp to a minimum of one frame so a zero or
+    // negative duration still picks up one decoder step.
+    const float fps      = (float) TOKENIZER_SAMPLE_RATE / (float) TOKENIZER_HOP_LENGTH;
+    int         n_frames = (int) (duration_sec * fps + 0.5f);
+    if (n_frames < 1) {
+        n_frames = 1;
+    }
+    return n_frames;
+}
+
+qt_status pipeline_tts_synthesize(PipelineTTS *                pt,
+                                  BPETokenizer *               tok,
+                                  const struct qt_tts_params * params,
+                                  int64_t                      resolved_seed,
+                                  struct qt_audio *            out) {
     PromptBuilderOutput prompt;
-    const std::string   instruct = params.instruct ? params.instruct : "";
-    const std::string   speaker  = params.speaker ? params.speaker : "";
-    const std::string   ref_text = params.ref_text ? params.ref_text : "";
+    const std::string   instruct = params->instruct ? params->instruct : "";
+    const std::string   speaker  = params->speaker ? params->speaker : "";
+    const std::string   ref_text = params->ref_text ? params->ref_text : "";
 
     // Voice clone mode A: if ref_audio_24k is given, run the speaker
     // encoder on the pre-decoded mono buffer and feed the resulting
     // embedding straight into the prompt builder. Mutually exclusive
     // with --speaker.
-    const bool         has_ref_audio = (params.ref_audio_24k != NULL) && (params.ref_n_samples > 0);
+    const bool         has_ref_audio = (params->ref_audio_24k != NULL) && (params->ref_n_samples > 0);
     std::vector<float> ref_spk_emb;
     const float *      ref_spk_emb_ptr = NULL;
     if (has_ref_audio) {
@@ -291,18 +338,18 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
             qt_set_error(
                 "pipeline_tts_synthesize: --ref-wav requires a model with a loaded speaker encoder (Base only)");
             qt_log(QT_LOG_ERROR, "[Pipeline] --ref-wav requires a model with a loaded speaker encoder (Base only)");
-            return false;
+            return QT_STATUS_GENERATE_FAILED;
         }
-        if (!speaker_encoder_extract(&pt->speaker_encoder, pt->sched, params.ref_audio_24k, params.ref_n_samples,
-                                     ref_spk_emb, params.dump_dir)) {
-            return false;
+        if (!speaker_encoder_extract(&pt->speaker_encoder, pt->sched, params->ref_audio_24k, params->ref_n_samples,
+                                     ref_spk_emb, params->dump_dir)) {
+            return QT_STATUS_GENERATE_FAILED;
         }
         if ((int) ref_spk_emb.size() != pt->talker.hidden_size) {
             qt_set_error("pipeline_tts_synthesize: speaker embedding size %zu mismatches talker hidden %d",
                          ref_spk_emb.size(), pt->talker.hidden_size);
             qt_log(QT_LOG_ERROR, "[Pipeline] speaker embedding size %zu mismatches talker hidden %d",
                    ref_spk_emb.size(), pt->talker.hidden_size);
-            return false;
+            return QT_STATUS_GENERATE_FAILED;
         }
         ref_spk_emb_ptr = ref_spk_emb.data();
     }
@@ -318,35 +365,35 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         if (!has_ref_audio) {
             qt_set_error("pipeline_tts_synthesize: --ref-text requires --ref-wav");
             qt_log(QT_LOG_ERROR, "[Pipeline] --ref-text requires --ref-wav");
-            return false;
+            return QT_STATUS_INVALID_PARAMS;
         }
         // The codec hop is 1920 samples at 24 kHz so n_samples must be
         // a multiple of 1920. Truncate to the nearest hop boundary.
-        if (params.ref_n_samples < TOKENIZER_HOP_LENGTH) {
-            qt_set_error("pipeline_tts_synthesize: ref_wav too short for ICL (%d samples)", params.ref_n_samples);
-            qt_log(QT_LOG_ERROR, "[Pipeline] ref_wav too short for ICL (%d samples)", params.ref_n_samples);
-            return false;
+        if (params->ref_n_samples < TOKENIZER_HOP_LENGTH) {
+            qt_set_error("pipeline_tts_synthesize: ref_wav too short for ICL (%d samples)", params->ref_n_samples);
+            qt_log(QT_LOG_ERROR, "[Pipeline] ref_wav too short for ICL (%d samples)", params->ref_n_samples);
+            return QT_STATUS_INVALID_PARAMS;
         }
-        int aligned_T = (params.ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
-        ref_codes     = pipeline_codec_encode(&pt->codec, params.ref_audio_24k, aligned_T, params.dump_dir);
+        int aligned_T = (params->ref_n_samples / TOKENIZER_HOP_LENGTH) * TOKENIZER_HOP_LENGTH;
+        ref_codes     = pipeline_codec_encode(&pt->codec, params->ref_audio_24k, aligned_T, params->dump_dir);
         if (ref_codes.empty()) {
             qt_set_error("pipeline_tts_synthesize: pipeline_codec_encode returned empty codes");
             qt_log(QT_LOG_ERROR, "[Pipeline] pipeline_codec_encode returned empty codes");
-            return false;
+            return QT_STATUS_GENERATE_FAILED;
         }
         ref_codes_T = (int) ref_codes.size() / pt->num_code_groups;
         qt_log(QT_LOG_INFO, "[Pipeline] ICL ref_codes: %d frames at 12.5 Hz (%d audio samples)", ref_codes_T,
                aligned_T);
     }
 
-    if (!prompt_builder_build(pt, tok, params.text, params.lang, instruct, speaker, ref_spk_emb_ptr, ref_text,
+    if (!prompt_builder_build(pt, tok, params->text, params->lang, instruct, speaker, ref_spk_emb_ptr, ref_text,
                               ref_codes_T > 0 ? ref_codes.data() : NULL, ref_codes_T, &prompt)) {
-        return false;
+        return QT_STATUS_GENERATE_FAILED;
     }
 
-    if (params.dump_dir) {
+    if (params->dump_dir) {
         DebugDumper d;
-        debug_init(&d, params.dump_dir);
+        debug_init(&d, params->dump_dir);
         std::vector<int32_t> ids32(prompt.prompt_ids.begin(), prompt.prompt_ids.end());
         int                  n_ids = (int) ids32.size();
         debug_dump_i32_as_f32(&d, "prompt-ids", ids32.data(), &n_ids, 1);
@@ -354,12 +401,12 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         debug_dump_2d(&d, "trailing-text-hidden", prompt.trailing_text_hidden.data(), prompt.T_trailing, prompt.hidden);
         debug_dump_1d(&d, "tts-pad-embed", prompt.tts_pad_embed.data(), prompt.hidden);
 
-        // Voice clone dumps: speaker-emb fires when ref_wav is set
+        // Voice clone dumps: spk-emb fires when ref_wav is set
         // (modes A and B), ref-codes fires only when ref_text is also set
         // (mode B ICL). Both are no-ops in base / tts / customvoice modes,
         // the dump files simply do not appear in those runs.
         if (ref_spk_emb_ptr != NULL) {
-            debug_dump_1d(&d, "speaker-emb", ref_spk_emb_ptr, pt->talker.hidden_size);
+            debug_dump_1d(&d, "spk-emb", ref_spk_emb_ptr, pt->talker.hidden_size);
         }
         if (ref_codes_T > 0) {
             const int shape[2] = { pt->num_code_groups, ref_codes_T };
@@ -367,34 +414,35 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         }
     }
 
-    // Generation loop: at each step we recompute the full Talker prefix
-    // (no KV cache yet) over the prompt prefix concatenated with all the
-    // next-token embeddings produced so far, sample c0, run the code
-    // predictor for the 15 acoustic codes, build the next-token
-    // embedding by summing the 16 codebook embeddings and the matching
-    // trailing-text overlay, and append it to the running context. We
-    // stop on codec_eos or when max_new_tokens is reached.
-    const int hidden        = prompt.hidden;
-    const int codec_eos_id  = pt->codec_specials.eos_id;
-    const int num_codebooks = pt->num_code_groups;
-    const int talker_vocab  = pt->talker.vocab_size;
-
-    // Greedy collapses to temperature <= 0 in sample_top_k_p.
-    float talker_T  = params.do_sample ? params.temperature : 0.0f;
-    float subtk_T   = params.subtalker_do_sample ? params.subtalker_temperature : 0.0f;
-    float talker_rp = params.repetition_penalty;
-
     // Generation loop: step 0 prefills the talker over the full prompt
     // and writes T_ctx positions into the KV cache. Subsequent steps
     // feed one next_emb at a time and append one position. The code
     // predictor maintains its own per-frame cache that gets reset at
     // every step.
+    const int   hidden        = prompt.hidden;
+    const int   codec_eos_id  = pt->codec_specials.eos_id;
+    const int   num_codebooks = pt->num_code_groups;
+    const int   talker_vocab  = pt->talker.vocab_size;
+    const bool  use_fa        = pt->use_flash_attn;
+    const bool  clamp_fp16    = pt->clamp_fp16;
+    const float talker_T      = params->do_sample ? params->temperature : 0.0f;
+    const float subtk_T       = params->subtalker_do_sample ? params->subtalker_temperature : 0.0f;
+    const float talker_rp     = params->repetition_penalty;
+
+    // Streaming config: when on_chunk is set, decode the codec every
+    // chunk_frames AR frames and emit through the callback. The buffered
+    // path keeps every code, decodes once at the very end and copies the
+    // resulting audio into out. chunk_frames <= 0 falls back to 1 second.
+    const bool  streaming    = (params->on_chunk != NULL);
+    const float chunk_sec    = params->chunk_duration_sec > 0.0f ? params->chunk_duration_sec : 1.0f;
+    const int   chunk_frames = pipeline_tts_duration_sec_to_tokens(pt, chunk_sec);
+
     std::vector<std::vector<int32_t>> all_codes;
-    all_codes.reserve((size_t) params.max_new_tokens);
+    all_codes.reserve((size_t) params->max_new_tokens);
 
     // c0 codes already emitted, fed to repetition penalty.
     std::vector<int32_t> talker_history;
-    talker_history.reserve((size_t) params.max_new_tokens);
+    talker_history.reserve((size_t) params->max_new_tokens);
 
     // Global Philox subsequence counter advances once per primitive
     // sample (one for c0 of each step, then 15 for the predictor codes).
@@ -402,18 +450,58 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
 
     std::vector<float> next_emb((size_t) hidden, 0.0f);
 
-    for (int step = 0; step < params.max_new_tokens; step++) {
+    // Streaming bookkeeping: pending_codes accumulates frames since the
+    // last emit; emit_pending decodes them through the codec and feeds
+    // on_chunk. Returns false to abort with QT_STATUS_CANCELLED.
+    std::vector<std::vector<int32_t>> pending_codes;
+    pending_codes.reserve((size_t) chunk_frames);
+
+    auto emit_pending = [&]() -> bool {
+        if (pending_codes.empty()) {
+            return true;
+        }
+        const int            T_frames = (int) pending_codes.size();
+        std::vector<int32_t> codes_kt((size_t) num_codebooks * (size_t) T_frames);
+        for (int t = 0; t < T_frames; t++) {
+            for (int k = 0; k < num_codebooks; k++) {
+                codes_kt[(size_t) k * (size_t) T_frames + (size_t) t] = pending_codes[(size_t) t][(size_t) k];
+            }
+        }
+        std::vector<float> chunk_audio = pipeline_codec_decode(&pt->codec, codes_kt.data(), num_codebooks, T_frames);
+        if (chunk_audio.empty()) {
+            qt_set_error("pipeline_tts_synthesize: streaming codec decode returned no audio");
+            qt_log(QT_LOG_ERROR, "[Pipeline] streaming codec decode returned no audio");
+            return false;
+        }
+        if (!params->on_chunk(chunk_audio.data(), (int) chunk_audio.size(), params->on_chunk_user_data)) {
+            qt_log(QT_LOG_INFO, "[Pipeline] on_chunk callback aborted the synthesis");
+            return false;
+        }
+        pending_codes.clear();
+        return true;
+    };
+
+    for (int step = 0; step < params->max_new_tokens; step++) {
+        // Cooperative cancellation, polled at every step. Granularity is
+        // one AR frame = 1 / 12.5 Hz ~ 83 ms of audio, which is well
+        // below any reasonable UX cancel latency target.
+        if (params->cancel && params->cancel(params->cancel_user_data)) {
+            qt_log(QT_LOG_INFO, "[Pipeline] cancelled at step %d", step);
+            return QT_STATUS_CANCELLED;
+        }
+
         TalkerForwardOutput fw;
-        const char *        step_dump = (params.dump_dir && step == 0) ? params.dump_dir : NULL;
+        const char *        step_dump = (params->dump_dir && step == 0) ? params->dump_dir : NULL;
         bool                ok;
         if (step == 0) {
             ok = talker_forward_prefill(&pt->talker, &pt->talker_kv, pt->sched, prompt.input_embed.data(), prompt.T_ctx,
-                                        step_dump, &fw);
+                                        use_fa, clamp_fp16, step_dump, &fw);
         } else {
-            ok = talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, next_emb.data(), &fw);
+            ok =
+                talker_forward_decode(&pt->talker, &pt->talker_kv, pt->sched, next_emb.data(), use_fa, clamp_fp16, &fw);
         }
         if (!ok) {
-            return false;
+            return QT_STATUS_GENERATE_FAILED;
         }
 
         // Bisection dump: the talker hidden_last at step 1 is the input
@@ -421,9 +509,9 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         // step 0. Pairing it byte for byte with the Python hook tells us
         // whether the next-emb composition + talker decode round trip
         // is bit exact end to end.
-        if (params.dump_dir && step == 1) {
+        if (params->dump_dir && step == 1) {
             DebugDumper d;
-            debug_init(&d, params.dump_dir);
+            debug_init(&d, params->dump_dir);
             debug_dump_1d(&d, "talker-hidden-step1", fw.hidden_last.data(), hidden);
         }
 
@@ -431,12 +519,13 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         // codec_eos. Then run the upstream sampling chain.
         apply_suppress(fw.logits_last.data(), talker_vocab, talker_vocab - 1024, talker_vocab, codec_eos_id);
         float u_c0 = 0.0f;
-        int   c0 = sample_top_k_p(fw.logits_last.data(), talker_vocab, talker_T, params.top_k, params.top_p, talker_rp,
-                                  talker_history.data(), (int) talker_history.size(), params.seed, subseq_counter, &u_c0);
+        int   c0 =
+            sample_top_k_p(fw.logits_last.data(), talker_vocab, talker_T, params->top_k, params->top_p, talker_rp,
+                           talker_history.data(), (int) talker_history.size(), resolved_seed, subseq_counter, &u_c0);
         subseq_counter++;
         if (c0 < 0) {
             qt_log(QT_LOG_ERROR, "[Pipeline] c0 sample returned no candidate");
-            return false;
+            return QT_STATUS_GENERATE_FAILED;
         }
 
         // Trace the first 32 samples unconditionally so [Sample] lines
@@ -453,11 +542,11 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         }
 
         CodePredictorOutput cp;
-        const char *        cp_dump = (params.dump_dir && step == 0) ? params.dump_dir : NULL;
+        const char *        cp_dump = (params->dump_dir && step == 0) ? params->dump_dir : NULL;
         if (!code_predictor_step(&pt->talker, &pt->code_predictor, &pt->code_predictor_kv, pt->sched,
-                                 fw.hidden_last.data(), c0, subtk_T, params.subtalker_top_k, params.subtalker_top_p,
-                                 params.seed, subseq_counter - 1, cp_dump, &cp)) {
-            return false;
+                                 fw.hidden_last.data(), c0, subtk_T, params->subtalker_top_k, params->subtalker_top_p,
+                                 resolved_seed, subseq_counter - 1, use_fa, clamp_fp16, cp_dump, &cp)) {
+            return QT_STATUS_GENERATE_FAILED;
         }
         // Predictor consumed (num_codebooks - 1) subsequences after the
         // c0 one (subseq_base + 1 .. subseq_base + 15).
@@ -465,6 +554,14 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
 
         all_codes.push_back(cp.codes);
         talker_history.push_back(c0);
+        if (streaming) {
+            pending_codes.push_back(cp.codes);
+            if ((int) pending_codes.size() >= chunk_frames) {
+                if (!emit_pending()) {
+                    return QT_STATUS_CANCELLED;
+                }
+            }
+        }
 
         // Build next-token embedding: sum of 16 codebook embeddings.
         // codebook 0 uses talker.codec_embedding, the 15 acoustic
@@ -500,9 +597,9 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         // is the only thing controlling the talker forward at step 1, so
         // matching it bit-exact against Python pinpoints any drift in
         // the codebook embedding sums or the trailing text overlay.
-        if (params.dump_dir && step == 0) {
+        if (params->dump_dir && step == 0) {
             DebugDumper d;
-            debug_init(&d, params.dump_dir);
+            debug_init(&d, params->dump_dir);
             debug_dump_1d(&d, "next-emb-step0", next_emb.data(), hidden);
         }
 
@@ -513,9 +610,9 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
 
     qt_log(QT_LOG_INFO, "[Pipeline] Generation done : %zu frames", all_codes.size());
 
-    if (params.dump_dir && !all_codes.empty()) {
+    if (params->dump_dir && !all_codes.empty()) {
         DebugDumper d;
-        debug_init(&d, params.dump_dir);
+        debug_init(&d, params->dump_dir);
         int                  T_frames = (int) all_codes.size();
         std::vector<int32_t> flat((size_t) T_frames * (size_t) num_codebooks);
         for (int t = 0; t < T_frames; t++) {
@@ -527,31 +624,56 @@ bool pipeline_tts_synthesize(PipelineTTS *                       pt,
         debug_dump_i32_as_f32(&d, "codes-full", flat.data(), shape, 2);
     }
 
-    // Codec decode: transpose codes from [T_frames, K] to [K, T_frames]
-    // because pipeline_codec_decode expects K-major layout (codebooks
-    // first, frames second), then return the 24 kHz mono audio.
-    if (all_codes.empty()) {
-        return true;
+    // Streaming tail: flush remaining frames through the callback. The
+    // buffered output stays empty in this branch; the caller already
+    // received every sample through on_chunk.
+    if (streaming) {
+        if (!emit_pending()) {
+            return QT_STATUS_CANCELLED;
+        }
+        out->samples     = NULL;
+        out->n_samples   = 0;
+        out->sample_rate = TOKENIZER_SAMPLE_RATE;
+        out->channels    = 1;
+        return QT_STATUS_OK;
     }
 
-    int                  T_frames = (int) all_codes.size();
+    // Buffered path: empty all_codes means EOS at step 0 with no audio.
+    // Return success and an empty qt_audio struct; the facade leaves it
+    // to the caller to decide what to do with a zero sample synthesis.
+    if (all_codes.empty()) {
+        out->samples     = NULL;
+        out->n_samples   = 0;
+        out->sample_rate = TOKENIZER_SAMPLE_RATE;
+        out->channels    = 1;
+        return QT_STATUS_OK;
+    }
+
+    // Codec decode: transpose codes from [T_frames, K] to [K, T_frames]
+    // because pipeline_codec_decode expects K-major layout (codebooks
+    // first, frames second), then materialise the 24 kHz mono audio.
+    const int            T_frames = (int) all_codes.size();
     std::vector<int32_t> codes_kt((size_t) num_codebooks * (size_t) T_frames);
     for (int t = 0; t < T_frames; t++) {
         for (int k = 0; k < num_codebooks; k++) {
             codes_kt[(size_t) k * (size_t) T_frames + (size_t) t] = all_codes[(size_t) t][(size_t) k];
         }
     }
-    out->audio = pipeline_codec_decode(&pt->codec, codes_kt.data(), num_codebooks, T_frames);
-    if (out->audio.empty()) {
+    std::vector<float> audio = pipeline_codec_decode(&pt->codec, codes_kt.data(), num_codebooks, T_frames);
+    if (audio.empty()) {
+        qt_set_error("pipeline_tts_synthesize: codec decode returned no audio");
         qt_log(QT_LOG_ERROR, "[Pipeline] codec decode returned no audio");
-        return false;
+        return QT_STATUS_GENERATE_FAILED;
     }
 
-    if (params.dump_dir) {
+    if (params->dump_dir) {
         DebugDumper d;
-        debug_init(&d, params.dump_dir);
-        debug_dump_1d(&d, "output-audio", out->audio.data(), (int) out->audio.size());
+        debug_init(&d, params->dump_dir);
+        debug_dump_1d(&d, "output-audio", audio.data(), (int) audio.size());
     }
 
-    return true;
+    if (!fill_qt_audio(audio, out)) {
+        return QT_STATUS_OOM;
+    }
+    return QT_STATUS_OK;
 }

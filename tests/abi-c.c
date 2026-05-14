@@ -1,4 +1,4 @@
-/* tests/abi-c.c : link-only ABI smoke test for qwen.h.
+/* tests/abi-c.c: link-only ABI smoke test for qwen.h.
  *
  * Compiled in pure C99 with -Wall -Werror -pedantic. The purpose of this
  * test is NOT to run a full synthesis (no GGUF loaded, no model required);
@@ -22,11 +22,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+static bool stub_cancel(void * ud) {
+    (void) ud;
+    return false;
+}
+
+static bool stub_on_chunk(const float * samples, int n_samples, void * ud) {
+    (void) samples;
+    (void) n_samples;
+    (void) ud;
+    return true;
+}
+
 /* Counter incremented by the stub log callback. The probe checks that at
  * least one log line was routed through the callback by triggering a
- * qt_init failure (which emits a [qwen] ERROR line via qt_log). */
-static int               g_log_lines        = 0;
-static enum qt_log_level g_last_log_level = QT_LOG_DEBUG;
+ * qt_init failure (which emits a [Qwen] ERROR line via qt_log). */
+static int               g_log_lines         = 0;
+static enum qt_log_level g_last_log_level    = QT_LOG_DEBUG;
 static char              g_last_log_msg[512] = { 0 };
 
 static void stub_log(enum qt_log_level level, const char * msg, void * user_data) {
@@ -55,29 +67,44 @@ int main(void) {
     struct qt_tts_params params;
     qt_tts_default_params(&params);
 
-    /* Sanity-check a few default values, including the abi_version. */
-    if (params.max_new_tokens != 2048 || params.temperature != 0.9f) {
+    /* Sanity-check a few default values, including the abi_version and
+     * the new use_fa / clamp_fp16 / on_chunk / chunk_duration_sec slots. */
+    if (params.max_new_tokens != 2048 || params.chunk_duration_sec <= 0.0f) {
         fprintf(stderr, "[Probe] default values do not match\n");
         return 1;
     }
     if (iparams.abi_version != QT_ABI_VERSION || params.abi_version != QT_ABI_VERSION) {
-        fprintf(stderr, "[Probe] abi_version not set by qwen_*_default_params\n");
+        fprintf(stderr, "[Probe] abi_version not set by qt_*_default_params\n");
+        return 1;
+    }
+    if (!iparams.use_fa || iparams.clamp_fp16) {
+        fprintf(stderr, "[Probe] init_params defaults do not match (use_fa=true, clamp_fp16=false)\n");
+        return 1;
+    }
+    if (QT_CODEC_SAMPLE_RATE != 24000) {
+        fprintf(stderr, "[Probe] QT_CODEC_SAMPLE_RATE is not 24000\n");
         return 1;
     }
 
-    /* Touch every output struct field so the compiler validates the
-     * layout end-to-end without ever needing a model. */
+    /* Touch every reference-pointer field, every callback typedef and
+     * every output struct field so the compiler validates the layout
+     * end-to-end without ever needing a model. */
+    params.cancel             = stub_cancel;
+    params.cancel_user_data   = NULL;
+    params.on_chunk           = stub_on_chunk;
+    params.on_chunk_user_data = NULL;
+
     struct qt_audio audio = { 0 };
     qt_audio_free(&audio);
 
-    /* Install the log callback before the failing init so the [qwen]
+    /* Install the log callback before the failing init so the [Qwen]
      * ERROR line lands on stub_log instead of stderr. */
     qt_log_set(stub_log, NULL);
 
     /* Call every entry through its early-return path. qt_init returns
-     * NULL on missing talker_path / codec_path, qt_synthesize fails on
-     * NULL handle, qt_free is safe on NULL. None of these load a model,
-     * but the linker must resolve every name to satisfy the call. */
+     * NULL on missing paths, qt_synthesize / qt_duration_sec_to_tokens
+     * fail on NULL handle, qt_free is safe on NULL. None of these load a
+     * model, but the linker must resolve every name to satisfy the call. */
     struct qt_context * dummy = qt_init(NULL);
     if (dummy != NULL) {
         fprintf(stderr, "[Probe] qt_init(NULL) was supposed to return NULL\n");
@@ -102,17 +129,14 @@ int main(void) {
         return 6;
     }
     if (g_last_log_level != QT_LOG_ERROR) {
-        fprintf(stderr, "[Probe] last log level was %d, expected %d\n", (int) g_last_log_level,
-                (int) QT_LOG_ERROR);
+        fprintf(stderr, "[Probe] last log level was %d, expected %d\n", (int) g_last_log_level, (int) QT_LOG_ERROR);
         return 7;
     }
     printf("[Probe] qt_log_set routed %d line(s), last: '%s'\n", g_log_lines, g_last_log_msg);
     printf("[Probe] qt_last_error reads '%s'\n", err);
 
     /* abi_version validation : a struct claiming a future ABI must be
-     * rejected up front, before any allocation. Both paths are filled
-     * with placeholders so the NULL guard does not short-circuit the
-     * abi_version branch. */
+     * rejected up front, before any allocation. */
     struct qt_init_params future_iparams;
     qt_init_default_params(&future_iparams);
     future_iparams.talker_path = "irrelevant.gguf";
@@ -132,8 +156,14 @@ int main(void) {
         return 3;
     }
 
+    int frames = qt_duration_sec_to_tokens(NULL, 1.0f);
+    if (frames < 1) {
+        fprintf(stderr, "[Probe] qt_duration_sec_to_tokens returned %d, expected >= 1\n", frames);
+        return 4;
+    }
+
     /* Restore the default stderr fallback before exit so the trailing
-     * [qwen] log lines from the cleanup paths land where the user
+     * [Qwen] log lines from the cleanup paths land where the user
      * expects them. */
     qt_log_set(NULL, NULL);
 

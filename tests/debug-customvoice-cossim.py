@@ -35,12 +35,10 @@ CKPT        = "../checkpoints/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 DUMP_CPP    = "cpp/customvoice"
 DUMP_PT     = "python/customvoice"
 
-DEFAULT_SPEAKER = "vivian"
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt",         default="../examples/prompt.txt")
-    ap.add_argument("--speaker",        default=DEFAULT_SPEAKER,
+    ap.add_argument("--speaker",        default="vivian",
                     help="speaker preset key (lowercase), validated by the model")
     ap.add_argument("--instruct",       default="",
                     help="optional style instruction, empty disables the instruct prefix")

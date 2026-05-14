@@ -75,11 +75,38 @@ static bool talker_is_bisect_layer(int l) {
     return false;
 }
 
+// Manual F32 attention chain. Used when use_flash_attn is false: GQA
+// scaled dot product with explicit mul_mat / soft_max_ext / mul_mat,
+// FP32 accumulators end to end. Mirrors the qwen3_attn_f32 helper in
+// omnivoice.cpp/src/qwen3-enc.h. Inputs and output stay in the same
+// layout flash_attn_ext expects: q [hd, T, n_q_heads], k/v [hd, T_full,
+// n_kv], output [hd, n_q_heads, T]; the caller reshapes to
+// [n_q_heads * hd, T] before o_proj exactly as on the FA path.
+static struct ggml_tensor * talker_attn_f32(struct ggml_context * ctx,
+                                            struct ggml_tensor *  q,
+                                            struct ggml_tensor *  k,
+                                            struct ggml_tensor *  v,
+                                            struct ggml_tensor *  mask,
+                                            float                 scale) {
+    struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
+    scores                      = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
+    struct ggml_tensor * vt     = ggml_cont(ctx, ggml_transpose(ctx, v));
+    struct ggml_tensor * out    = ggml_mul_mat(ctx, vt, scores);
+    return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+}
+
 // Build the per-layer block, KV cached. K and V for the T fresh
 // positions get computed normally, then written into the cache at
 // [n_past, n_past+T) on dim 1. The attention reads the contiguous slice
 // [0, n_past+T) on the same dim, which covers the full causal context
 // in one tensor view. Returns the layer output [hidden, T].
+//
+// use_flash_attn picks between the fused ggml_flash_attn_ext kernel
+// (GPU only, FP16 accumulation guarded with set_prec(F32)) and the
+// manual F32 chain. clamp_fp16 inserts ggml_clamp(-65504, 65504) on V
+// before attention and on the residual stream after the attention and
+// MLP adds, protecting sub Ampere CUDA tensor cores that accumulate in
+// FP16 from overflow.
 static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
                                                  const TalkerWeights * tw,
                                                  const TalkerLayer &   layer,
@@ -90,6 +117,8 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
                                                  struct ggml_tensor *  v_cache,
                                                  int                   n_past,
                                                  int                   T,
+                                                 bool                  use_flash_attn,
+                                                 bool                  clamp_fp16,
                                                  struct ggml_cgraph *  gf) {
     const int   n_q_heads = tw->num_attention_heads;
     const int   n_kv      = tw->num_key_value_heads;
@@ -156,16 +185,32 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     // No cont: flash_attn_ext takes the view directly, like acestep does.
     struct ggml_tensor * q_p = ggml_permute(ctx, q, 0, 2, 1, 3);
 
-    // Fused flash attention. The manual mul_mat + soft_max_ext + mul_mat
-    // path it replaces had a Vulkan bug in autoregressive decode (T=1)
-    // where the KV cache view stride on dim 2 (= max_T * hd, non
+    // Clamp V before attention. Sub Ampere tensor cores accumulate in
+    // FP16 and the V projection can overflow to inf, which corrupts
+    // every subsequent attention. ggml_clamp is a no op on the F32
+    // manual path but stays here to keep both branches numerically
+    // aligned when the user opts into clamp_fp16.
+    if (clamp_fp16) {
+        v_full = ggml_clamp(ctx, v_full, -65504.0f, 65504.0f);
+    }
+
+    // Attention: fused flash kernel (FP16 accumulation, set_prec(F32)
+    // promotes the softmax / V matmul accumulator back to F32) or
+    // manual F32 chain. The fused path replaces a mul_mat + soft_max_ext
+    // + mul_mat sequence that had a Vulkan bug in autoregressive decode
+    // (T=1) where the KV cache view stride on dim 2 (= max_T * hd, non
     // contiguous with dim 1 of length T_full) caused the second mul_mat
-    // to diverge silently. Flash attention has a backend-tested kernel
-    // on every target (CPU, CUDA, Vulkan), matches the working acestep
-    // qw3lm_build_attn pattern.
+    // to diverge silently. The manual path is the F32 reference, used
+    // when use_flash_attn is false (CPU only backends, or explicit
+    // request from the user).
     float                scale = 1.0f / sqrtf((float) hd);
-    struct ggml_tensor * attn  = ggml_flash_attn_ext(ctx, q_p, k_full, v_full, mask, scale, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+    struct ggml_tensor * attn;
+    if (use_flash_attn) {
+        attn = ggml_flash_attn_ext(ctx, q_p, k_full, v_full, mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+    } else {
+        attn = talker_attn_f32(ctx, q_p, k_full, v_full, mask, scale);
+    }
 
     // Flash attention output is [hd, n_q_heads, T], flatten heads for o_proj.
     attn = ggml_reshape_2d(ctx, attn, n_q_heads * hd, T);
@@ -173,6 +218,9 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     struct ggml_tensor * o = ggml_mul_mat(ctx, layer.attn.o_proj_w, attn);
 
     x = ggml_add(ctx, x, o);
+    if (clamp_fp16) {
+        x = ggml_clamp(ctx, x, -65504.0f, 65504.0f);
+    }
 
     // MLP block: pre-norm + SwiGLU + residual
     struct ggml_tensor * h2 = ggml_rms_norm(ctx, x, eps);
@@ -185,19 +233,25 @@ static struct ggml_tensor * talker_layer_forward(struct ggml_context * ctx,
     struct ggml_tensor * mlp  = ggml_mul_mat(ctx, layer.mlp.down_proj_w, gu);
 
     x = ggml_add(ctx, x, mlp);
+    if (clamp_fp16) {
+        x = ggml_clamp(ctx, x, -65504.0f, 65504.0f);
+    }
     return x;
 }
 
 // Shared core that builds the graph, allocates, uploads inputs, runs
 // it and pulls out the last position hidden + logits. T tokens are
 // appended to the cache starting at n_past. When n_past == 0 and
-// dump_dir is set, the bisect taps fire on the prefill path.
+// dump_dir is set, the bisect taps fire on the prefill path. use_fa /
+// clamp_fp16 are forwarded as is to every layer.
 static bool talker_forward_core(const TalkerWeights * tw,
                                 KVCache *             kv,
                                 ggml_backend_sched_t  sched,
                                 const float *         input_embed,
                                 int                   T,
                                 int                   n_past,
+                                bool                  use_flash_attn,
+                                bool                  clamp_fp16,
                                 const char *          dump_dir,
                                 TalkerForwardOutput * out) {
     const int hidden   = tw->hidden_size;
@@ -242,7 +296,7 @@ static bool talker_forward_core(const TalkerWeights * tw,
     std::vector<struct ggml_tensor *> taps(TALKER_N_BISECT_LAYERS, NULL);
     for (int l = 0; l < n_layers; l++) {
         h = talker_layer_forward(gctx, tw, tw->layers[(size_t) l], h, pos_in, mask_in, kv->k[(size_t) l],
-                                 kv->v[(size_t) l], n_past, T, gf);
+                                 kv->v[(size_t) l], n_past, T, use_flash_attn, clamp_fp16, gf);
         if (record_taps && talker_is_bisect_layer(l)) {
             for (int i = 0; i < TALKER_N_BISECT_LAYERS; i++) {
                 if (TALKER_BISECT_LAYERS[i] == l) {
@@ -374,6 +428,8 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
                                    ggml_backend_sched_t  sched,
                                    const float *         input_embed,
                                    int                   T,
+                                   bool                  use_flash_attn,
+                                   bool                  clamp_fp16,
                                    const char *          dump_dir,
                                    TalkerForwardOutput * out) {
     kv_cache_reset(kv);
@@ -381,7 +437,7 @@ static bool talker_forward_prefill(const TalkerWeights * tw,
         fprintf(stderr, "[TalkerForward] FATAL: prefill T=%d exceeds cache max_seq_len=%d\n", T, kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, input_embed, T, 0, dump_dir, out);
+    return talker_forward_core(tw, kv, sched, input_embed, T, 0, use_flash_attn, clamp_fp16, dump_dir, out);
 }
 
 // Decode: feed exactly one embedding and append one position to the
@@ -391,11 +447,13 @@ static bool talker_forward_decode(const TalkerWeights * tw,
                                   KVCache *             kv,
                                   ggml_backend_sched_t  sched,
                                   const float *         input_embed_1,
+                                  bool                  use_flash_attn,
+                                  bool                  clamp_fp16,
                                   TalkerForwardOutput * out) {
     if (kv->cur_len + 1 > kv->max_seq_len) {
         fprintf(stderr, "[TalkerForward] FATAL: decode would overflow cache (%d + 1 > %d)\n", kv->cur_len,
                 kv->max_seq_len);
         return false;
     }
-    return talker_forward_core(tw, kv, sched, input_embed_1, 1, kv->cur_len, NULL, out);
+    return talker_forward_core(tw, kv, sched, input_embed_1, 1, kv->cur_len, use_flash_attn, clamp_fp16, NULL, out);
 }

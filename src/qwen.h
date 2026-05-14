@@ -56,8 +56,15 @@ extern "C" {
 // There is no separate semver triple. The runtime build identity is the
 // git short hash + commit date string returned by qt_version(); for
 // binding compat checks, QT_ABI_VERSION is the only number that
-// matters. Aligned on OV_ABI_VERSION = 2 for the omnivoice ABI cousin.
-#define QT_ABI_VERSION 2
+// matters.
+#define QT_ABI_VERSION 1
+
+// Codec sample rate. The 12 Hz Qwen3-TTS audio tokenizer always produces
+// 24 kHz mono PCM through its DAC v2 decoder. Exposed at the ABI so a
+// caller that needs to resample a reference WAV before passing it via
+// qt_tts_params.ref_audio_24k can do so without pulling in any internal
+// header. The constant is immutable for this model family.
+#define QT_CODEC_SAMPLE_RATE 24000
 
 // Returns a static string of the form "<git-hash> (<date>)" identifying
 // the exact commit this binary was built from. Safe to call from any
@@ -72,6 +79,7 @@ enum qt_status {
     QT_STATUS_MODE_INVALID    = -2,
     QT_STATUS_GENERATE_FAILED = -3,
     QT_STATUS_OOM             = -4,
+    QT_STATUS_CANCELLED       = -5,
 };
 
 // Returns the last error message produced on the calling thread by any
@@ -93,7 +101,7 @@ QT_API const char * qt_last_error(void);
 struct qt_audio {
     float * samples;      // mono PCM, malloc allocated
     int     n_samples;    // length in samples
-    int     sample_rate;  // 24000 for the 12 Hz Qwen3-TTS tokenizer
+    int     sample_rate;  // QT_CODEC_SAMPLE_RATE (24000)
     int     channels;     // 1 (mono)
 };
 
@@ -109,16 +117,21 @@ struct qt_context;
 // custom_voice / voice_design checkpoints) the speaker encoder; the
 // codec GGUF holds the 12 Hz audio tokenizer. abi_version stays first
 // so a future struct growth keeps reading the version field at offset
-// 0. No use_fa / clamp_fp16 yet: the current pipeline_tts_load picks
-// flash attention from backend capability without a user knob.
+// 0. use_fa enables fused flash attention in the Talker and Code
+// Predictor forwards when a GPU backend is present (CPU always uses the
+// F32 manual chain); clamp_fp16 inserts ggml_clamp(-65504, 65504) on V
+// before attention and on the residual stream between blocks to guard
+// FP16 matmul accumulation on sub Ampere CUDA targets.
 struct qt_init_params {
     int          abi_version;
     const char * talker_path;
     const char * codec_path;
+    bool         use_fa;
+    bool         clamp_fp16;
 };
 
 // Initialise to the standard defaults: both paths NULL (caller must set
-// them before calling qt_init), abi_version set to QT_ABI_VERSION.
+// them before calling qt_init), use_fa true, clamp_fp16 false.
 QT_API void qt_init_default_params(struct qt_init_params * p);
 
 // Allocate every module described by params. Returns NULL on any
@@ -130,6 +143,27 @@ QT_API struct qt_context * qt_init(const struct qt_init_params * params);
 // Release every module owned by the handle and free the handle itself.
 // Safe on NULL.
 QT_API void qt_free(struct qt_context * q);
+
+// Cooperative cancellation callback. Returns true to request the
+// synthesis to abort. Polled at the top of every Talker decode step in
+// the autoregressive loop, so the cancel granularity is roughly one
+// audio frame, i.e. 1 / 12 Hz ~ 83 ms.
+typedef bool (*qt_cancel_cb)(void * user_data);
+
+// Streaming output callback. When set on qt_tts_params, the synth
+// pipeline runs in streaming mode: audio is decoded chunk by chunk from
+// the AR codec frames and emitted through this callback rather than
+// accumulated into the `out` buffer of qt_synthesize. Returning false
+// aborts the synthesis with QT_STATUS_CANCELLED, identical to the
+// qt_cancel_cb behaviour. The samples pointer is mono float PCM at
+// QT_CODEC_SAMPLE_RATE; valid only for the duration of the call.
+// user_data is forwarded verbatim from on_chunk_user_data.
+//
+// The chunk granularity is driven by chunk_duration_sec in qt_tts_params:
+// once the AR loop has produced enough frames to cover that duration,
+// the codec decodes that bundle and emits it. The last chunk on EOS /
+// max_new flushes whatever frames remain.
+typedef bool (*qt_audio_chunk_cb)(const float * samples, int n_samples, void * user_data);
 
 // Log severity. Numerically ordered so a callback can filter with a
 // simple `if (level < threshold) return;`. ERROR is reserved for
@@ -184,8 +218,8 @@ struct qt_tts_params {
     // Optional voice reference for base mode voice cloning. Mode A
     // (x_vector_only) sets ref_audio_24k only; mode B (ICL) sets
     // both ref_audio_24k and ref_text. ref_audio_24k is a mono float
-    // PCM buffer sampled at the codec sample rate (24 kHz). Mutually
-    // exclusive with speaker. Rejected for custom_voice / voice_design.
+    // PCM buffer sampled at QT_CODEC_SAMPLE_RATE. Mutually exclusive
+    // with speaker. Rejected for custom_voice / voice_design.
     const float * ref_audio_24k;
     int           ref_n_samples;
     const char *  ref_text;
@@ -211,21 +245,44 @@ struct qt_tts_params {
     // Intermediate tensor dump directory. NULL disables dumps. Debug
     // only, slows the run.
     const char * dump_dir;
+
+    // Cooperative cancellation. cancel NULL disables the feature.
+    // cancel_user_data is forwarded to the callback verbatim. Polled
+    // at the top of every Talker decode step (~83 ms granularity).
+    qt_cancel_cb cancel;
+    void *       cancel_user_data;
+
+    // Streaming output. When on_chunk is non NULL, qt_synthesize runs
+    // the streaming pipeline: audio chunks emit through on_chunk and
+    // `out` stays empty on success. on_chunk NULL keeps the buffered
+    // path. chunk_duration_sec drives the chunk size at codec sample
+    // rate; values <= 0 fall back to 1.0 second. The last chunk on
+    // EOS or max_new flushes whatever frames remain.
+    qt_audio_chunk_cb on_chunk;
+    void *            on_chunk_user_data;
+    float             chunk_duration_sec;
 };
 
 // Initialise to the standard defaults. Strings NULL, seed -1,
 // max_new_tokens 2048, do_sample true, temperature 0.9, top_k 50,
 // top_p 1.0, repetition_penalty 1.05, subtalker mirrors talker,
-// dump_dir NULL.
+// dump_dir NULL, cancel NULL, on_chunk NULL, chunk_duration_sec 1.0.
 QT_API void qt_tts_default_params(struct qt_tts_params * p);
 
 // Run the full TTS synthesis. Validates the params against the loaded
 // model_type (the seven base / custom_voice / voice_design rules),
 // resolves the seed, hands off to pipeline_tts_synthesize and fills
-// `out` with mono float PCM at the codec sample rate. Returns
-// QT_STATUS_OK on success; on any failure returns a negative
-// qt_status describing the cause and leaves `out` empty.
+// `out` with mono float PCM at QT_CODEC_SAMPLE_RATE in buffered mode.
+// In streaming mode (params->on_chunk != NULL), audio is emitted
+// through the callback and `out` stays empty. Returns QT_STATUS_OK on
+// success; on any failure returns a negative qt_status describing the
+// cause and leaves `out` empty.
 QT_API enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params * params, struct qt_audio * out);
+
+// Convert a duration in seconds to a frame count using the codec
+// frame rate (QT_CODEC_SAMPLE_RATE / TOKENIZER_HOP_LENGTH = 12.5 Hz).
+// Clamps to a minimum of one frame.
+QT_API int qt_duration_sec_to_tokens(const struct qt_context * q, float duration_sec);
 
 #ifdef __cplusplus
 }

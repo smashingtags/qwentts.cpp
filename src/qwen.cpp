@@ -4,10 +4,10 @@
 // so the symbols carry C linkage and are linkable from C, Rust, Go,
 // Python ctypes and any other binding generator. The struct
 // qt_context opaque handle owns one BackendPair, one PipelineTTS
-// (which embeds its PipelineCodec) and one BPETokenizer. qt_init
-// walks the load chain in dependency order and unwinds whatever it
-// already allocated when any step fails. qt_free mirrors that order
-// in reverse.
+// (which already embeds the PipelineCodec) and one BPETokenizer.
+// qt_init walks the load chain in dependency order and unwinds
+// whatever it already allocated when any step fails. qt_free mirrors
+// that order in reverse.
 //
 // This translation unit also absorbs the internal qt_set_error /
 // qt_throw / qt_log helpers that the rest of the codebase calls. The
@@ -137,6 +137,19 @@ void qt_log(qt_log_level level, const char * fmt, ...) {
     }
 }
 
+// Resolve a -1 seed to a hardware random 64-bit value. Anything else is
+// forwarded verbatim, so reproducibility is one explicit seed away. The
+// resolved value travels into pipeline_tts_synthesize so the dump traces
+// log the exact seed that drove the sampler, even when the caller asked
+// for non determinism.
+static int64_t qt_resolve_seed(int64_t seed) {
+    if (seed >= 0) {
+        return seed;
+    }
+    std::random_device rd;
+    return (int64_t) (((uint64_t) rd() << 32) ^ (uint64_t) rd());
+}
+
 extern "C" {
 
 const char * qt_version(void) {
@@ -174,12 +187,14 @@ void qt_init_default_params(struct qt_init_params * p) {
     p->abi_version = QT_ABI_VERSION;
     p->talker_path = nullptr;
     p->codec_path  = nullptr;
+    p->use_fa      = true;
+    p->clamp_fp16  = false;
 }
 
 void qt_tts_default_params(struct qt_tts_params * p) {
     p->abi_version           = QT_ABI_VERSION;
     p->text                  = nullptr;
-    p->lang                  = "english";
+    p->lang                  = nullptr;
     p->instruct              = nullptr;
     p->speaker               = nullptr;
     p->ref_audio_24k         = nullptr;
@@ -197,6 +212,11 @@ void qt_tts_default_params(struct qt_tts_params * p) {
     p->subtalker_top_k       = 50;
     p->subtalker_top_p       = 1.0f;
     p->dump_dir              = nullptr;
+    p->cancel                = nullptr;
+    p->cancel_user_data      = nullptr;
+    p->on_chunk              = nullptr;
+    p->on_chunk_user_data    = nullptr;
+    p->chunk_duration_sec    = 1.0f;
 }
 
 struct qt_context * qt_init(const struct qt_init_params * params) {
@@ -231,7 +251,8 @@ struct qt_context * qt_init(const struct qt_init_params * params) {
             qt_throw("qt_init: backend_init failed (no GGML backend available)");
         }
 
-        if (!pipeline_tts_load(&q->pt, params->talker_path, params->codec_path, q->bp)) {
+        if (!pipeline_tts_load(&q->pt, params->talker_path, params->codec_path, q->bp, params->use_fa,
+                               params->clamp_fp16)) {
             qt_throw("qt_init: pipeline_tts_load failed for '%s' / '%s'", params->talker_path, params->codec_path);
         }
 
@@ -266,29 +287,28 @@ void qt_free(struct qt_context * q) {
     delete q;
 }
 
-// Resolve a -1 seed to a hardware random 64-bit value. Anything else is
-// forwarded verbatim, so reproducibility is one explicit seed away.
-static int64_t qt_resolve_seed(int64_t seed) {
-    if (seed >= 0) {
-        return seed;
-    }
-    std::random_device rd;
-    return (int64_t) (((uint64_t) rd() << 32) ^ (uint64_t) rd());
-}
-
 enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params * params, struct qt_audio * out) {
-    if (!q || !params || !out) {
-        qt_set_error("qt_synthesize: q, params or out is NULL");
+    if (!q || !params) {
+        qt_set_error("qt_synthesize: q or params is NULL");
         if (out) {
             qt_audio_free(out);
         }
+        return QT_STATUS_INVALID_PARAMS;
+    }
+    // Streaming mode (on_chunk non NULL) emits through the callback and
+    // leaves out unused, so out=NULL is valid there. Buffered mode
+    // requires out to receive the synthesised waveform.
+    if (!params->on_chunk && !out) {
+        qt_set_error("qt_synthesize: out is NULL in buffered mode");
         return QT_STATUS_INVALID_PARAMS;
     }
     if (params->abi_version > QT_ABI_VERSION) {
         qt_set_error(
             "qt_synthesize: params->abi_version %d > QT_ABI_VERSION %d (binding compiled against a newer header)",
             params->abi_version, QT_ABI_VERSION);
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_INVALID_PARAMS;
     }
 
@@ -301,104 +321,79 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
     const std::string & mt = q->pt.model_type;
     if (params->speaker && mt != "custom_voice") {
         qt_set_error("--speaker is only valid for custom_voice models (loaded: %s)", mt.c_str());
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_MODE_INVALID;
     }
     if (params->instruct && mt == "base") {
         qt_set_error("--instruct is not supported for base models");
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_MODE_INVALID;
     }
     if (mt == "custom_voice" && !params->speaker) {
         qt_set_error("custom_voice models require --speaker");
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_MODE_INVALID;
     }
     if (mt == "voice_design" && (!params->instruct || params->instruct[0] == '\0')) {
         qt_set_error("voice_design models require --instruct");
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_MODE_INVALID;
     }
     if (params->ref_audio_24k && mt != "base") {
         qt_set_error("--ref-wav is only valid for base models (loaded: %s)", mt.c_str());
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_MODE_INVALID;
     }
     if (params->speaker && params->ref_audio_24k) {
         qt_set_error("--speaker and --ref-wav are mutually exclusive");
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_INVALID_PARAMS;
     }
     if (params->ref_text && !params->ref_audio_24k) {
         qt_set_error("--ref-text requires --ref-wav");
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_INVALID_PARAMS;
     }
 
-    // Translate the public POD params into the internal C++ struct
-    // expected by pipeline_tts_synthesize. Borrowed pointers are
-    // forwarded verbatim; the lifetime contract on the public side
-    // (caller keeps strings alive for the duration of the call)
-    // matches what the pipeline already requires.
-    PipelineTTSSynthesizeParams p = {};
-    p.text                        = params->text;
-    p.lang                        = params->lang;
-    p.instruct                    = params->instruct;
-    p.speaker                     = params->speaker;
-    p.ref_audio_24k               = params->ref_audio_24k;
-    p.ref_n_samples               = params->ref_n_samples;
-    p.ref_text                    = params->ref_text;
-    p.seed                        = qt_resolve_seed(params->seed);
-    p.max_new_tokens              = params->max_new_tokens;
-    p.do_sample                   = params->do_sample;
-    p.temperature                 = params->temperature;
-    p.top_k                       = params->top_k;
-    p.top_p                       = params->top_p;
-    p.repetition_penalty          = params->repetition_penalty;
-    p.subtalker_do_sample         = params->subtalker_do_sample;
-    p.subtalker_temperature       = params->subtalker_temperature;
-    p.subtalker_top_k             = params->subtalker_top_k;
-    p.subtalker_top_p             = params->subtalker_top_p;
-    p.dump_dir                    = params->dump_dir;
-
     // Defense in depth: the synthesis path normally reports failures
-    // via bool return + qt_set_error. A future load-style throw or any
-    // std::bad_alloc deep inside the GGML backend is caught here and
-    // converted to QT_STATUS_GENERATE_FAILED so an exception never
+    // via qt_status return + qt_set_error. A future load-style throw or
+    // any std::bad_alloc deep inside the GGML backend is caught here
+    // and converted to QT_STATUS_GENERATE_FAILED so an exception never
     // crosses the extern "C" boundary.
     try {
-        PipelineTTSSynthesizeOutput pout;
-        if (!pipeline_tts_synthesize(&q->pt, &q->tok, p, &pout)) {
-            qt_audio_free(out);
-            return QT_STATUS_GENERATE_FAILED;
-        }
-
-        // Copy the std::vector<float> into a malloc-backed buffer the
-        // caller can free with std::free via qt_audio_free. The
-        // vector itself goes out of scope at function exit, releasing
-        // its own storage independently.
-        const size_t n     = pout.audio.size();
-        const size_t bytes = n * sizeof(float);
-        float *      buf   = (float *) std::malloc(bytes > 0 ? bytes : 1);
-        if (!buf) {
-            qt_set_error("qt_synthesize: malloc failed for %zu samples", n);
-            qt_audio_free(out);
-            return QT_STATUS_OOM;
-        }
-        if (n > 0) {
-            std::memcpy(buf, pout.audio.data(), bytes);
-        }
-        out->samples     = buf;
-        out->n_samples   = (int) n;
-        out->sample_rate = pout.sample_rate;
-        out->channels    = 1;
-        return QT_STATUS_OK;
+        const int64_t resolved_seed = qt_resolve_seed(params->seed);
+        return pipeline_tts_synthesize(&q->pt, &q->tok, params, resolved_seed, out);
     } catch (const std::exception & e) {
         qt_set_error("%s", e.what());
         qt_log(QT_LOG_ERROR, "[Qwen] %s", e.what());
-        qt_audio_free(out);
+        if (out) {
+            qt_audio_free(out);
+        }
         return QT_STATUS_GENERATE_FAILED;
     }
+}
+
+int qt_duration_sec_to_tokens(const struct qt_context * q, float duration_sec) {
+    if (!q) {
+        qt_set_error("qt_duration_sec_to_tokens: q is NULL");
+        qt_log(QT_LOG_ERROR, "[Qwen] qt_duration_sec_to_tokens requires a valid handle");
+        return 1;
+    }
+    return pipeline_tts_duration_sec_to_tokens(&q->pt, duration_sec);
 }
 
 }  // extern "C"
